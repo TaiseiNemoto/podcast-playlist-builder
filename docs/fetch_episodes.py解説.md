@@ -2,13 +2,13 @@
 
 ## このスクリプトの目的
 
-[`scripts/fetch_episodes.py`](C:/Users/nemoto/Documents/dev/private/podcast-playlist-builder/scripts/fetch_episodes.py) は、Spotify API を使って 1 つの番組の全エピソード情報を取得し、`data/episodes.json` に保存するためのスクリプトです。
+[`scripts/fetch_episodes.py`](C:/Users/nemoto/Documents/dev/private/podcast-playlist-builder/scripts/fetch_episodes.py) は、Podcast の RSS を読み込み、1つの番組の全エピソード情報を取得して `data/episodes.json` に保存するためのスクリプトです。
 
 このスクリプトでやっていることは大きく 4 つです。
 
-1. 環境変数から Spotify の認証情報を読む
-2. アクセストークンを取得する
-3. 番組情報とエピソード一覧を Spotify API から取得する
+1. RSS URL を受け取る
+2. RSS XML を取得する
+3. 番組情報と各エピソード情報を取り出す
 4. JSON ファイルとして保存する
 
 ---
@@ -18,12 +18,14 @@
 PowerShell では次のように実行します。
 
 ```powershell
-$env:SPOTIFY_CLIENT_ID="your_client_id"
-$env:SPOTIFY_CLIENT_SECRET="your_client_secret"
-python scripts/fetch_episodes.py <show_id>
+python scripts/fetch_episodes.py "https://example.com/podcast.rss"
 ```
 
-`<show_id>` には Spotify の番組 ID を入れます。
+出力先を変えたい場合は `--output` を付けます。
+
+```powershell
+python scripts/fetch_episodes.py "https://example.com/podcast.rss" --output data/sample.json
+```
 
 ---
 
@@ -36,7 +38,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-これは「このファイルが直接実行されたときだけ `main()` を動かす」という Python の定番パターンです。
+つまり、直接このファイルを実行したときだけ `main()` が動きます。
 
 ---
 
@@ -46,273 +48,205 @@ if __name__ == "__main__":
 
 ```python
 import argparse
-import base64
 import json
-import os
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib import error, parse, request
+from urllib import error, request
 ```
 
 主な役割は次のとおりです。
 
-- `argparse`: コマンドライン引数を受け取る
-- `base64`: Spotify 認証用の文字列を Base64 に変換する
+- `argparse`: コマンドライン引数を扱う
 - `json`: JSON の読み書き
-- `os`: 環境変数を読む
-- `sys`: エラー終了時に標準エラー出力へ出す
-- `datetime`: 取得時刻を保存する
+- `sys`: エラーメッセージを標準エラー出力に出す
+- `xml.etree.ElementTree`: RSS XML を解析する
+- `datetime`: データ取得時刻を残す
 - `Path`: ファイルパスを扱いやすくする
 - `urllib.request`: HTTP リクエストを送る
 
-外部ライブラリは使っていないので、Python 標準機能だけで動きます。
+今回のポイントは、Spotify API のような JSON API ではなく、RSS という XML 形式を扱っていることです。
 
 ---
 
-## 2. 定数
+## 2. 名前空間の定数
 
 ```python
-TOKEN_URL = "https://accounts.spotify.com/api/token"
-API_BASE_URL = "https://api.spotify.com/v1"
+ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
+CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
 ```
 
-毎回同じ文字列を書くとミスしやすいので、先に定数としてまとめています。
+RSS では、標準のタグ以外に名前空間付きのタグがよく出てきます。
 
-- `TOKEN_URL`: アクセストークン取得先
-- `API_BASE_URL`: Spotify Web API の基本 URL
+例えば次のようなものです。
+
+- `itunes:summary`
+- `content:encoded`
+
+XML の解析では、こうしたタグを扱うために名前空間 URI を使います。
 
 ---
 
-## 3. `require_env`
+## 3. `fetch_xml`
 
 ```python
-def require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"環境変数 {name} が設定されていません。")
-    return value
+def fetch_xml(url: str) -> ET.Element:
 ```
 
-この関数は、必須の環境変数を読むためのものです。
+この関数は、RSS URL へアクセスして XML を取得し、ルート要素を返します。
 
-例えば `SPOTIFY_CLIENT_ID` が未設定なら、そのまま進まずにエラーにします。  
-初心者向けに言うと、「必要な設定が足りない状態で、後で分かりにくく失敗するのを防ぐ関数」です。
+中では次の流れです。
 
----
+1. `Request` オブジェクトを作る
+2. `urlopen()` で RSS を取得する
+3. レスポンス本文を文字列に変換する
+4. `ET.fromstring()` で XML を解析する
 
-## 4. `request_access_token`
-
-```python
-def request_access_token(client_id: str, client_secret: str) -> str:
-```
-
-この関数は、Spotify API を呼ぶためのアクセストークンを取得します。
-
-中では次のことをしています。
-
-1. `client_id:client_secret` という文字列を作る
-2. それを Base64 でエンコードする
-3. `grant_type=client_credentials` を送る
-4. Spotify から返ってきた JSON の `access_token` を取り出す
-
-重要なのはこの部分です。
-
-```python
-headers={
-    "Authorization": f"Basic {basic_token}",
-    "Content-Type": "application/x-www-form-urlencoded",
-}
-```
-
-Spotify の Client Credentials Flow では、`Authorization: Basic ...` ヘッダーを付けてトークンを取得します。
-
----
-
-## 5. `fetch_json`
-
-```python
-def fetch_json(req: request.Request) -> dict[str, Any]:
-```
-
-この関数は、HTTP リクエストを実行して、結果を JSON として返す共通処理です。
+重要部分はここです。
 
 ```python
 with request.urlopen(req) as res:
-    return json.loads(res.read().decode("utf-8"))
+    xml_text = res.read().decode("utf-8")
 ```
 
-ここでは次の順番で処理しています。
+これは HTTP レスポンスを読んでいる処理です。
 
-1. `urlopen(req)` で API を呼ぶ
-2. `res.read()` でレスポンス本文を読む
-3. `decode("utf-8")` で文字列にする
-4. `json.loads(...)` で Python の辞書に変換する
+そのあとで、
 
-また、例外処理も入れています。
+```python
+return ET.fromstring(xml_text)
+```
 
-- `HTTPError`: 400 や 401 など、HTTP として失敗した場合
-- `URLError`: ネットワーク接続自体に失敗した場合
-
-`RuntimeError` に変換しているので、呼び出し側では扱いやすくなります。
+として、XML 文字列を `ElementTree` の要素に変換しています。
 
 ---
 
-## 6. `api_get`
+## 4. `find_text`
 
 ```python
-def api_get(path: str, access_token: str, params: dict[str, Any]) -> dict[str, Any]:
+def find_text(element: ET.Element | None, path: str, default: str = "") -> str:
 ```
 
-Spotify API の GET リクエストをまとめた関数です。
+この関数は、「指定したタグの文字列を安全に取る」ための共通関数です。
 
-```python
-query = parse.urlencode(params)
-url = f"{API_BASE_URL}{path}?{query}"
-```
+例えば XML には、あるエピソードには `itunes:summary` があるけど、別のエピソードにはない、ということがあります。  
+そのたびに毎回 `None` チェックを書くとコードが読みにくくなるので、この関数でまとめています。
 
-ここで、例えば次のような URL を組み立てます。
+流れは単純です。
 
-```text
-https://api.spotify.com/v1/shows/{show_id}/episodes?market=JP&limit=50&offset=0
-```
-
-そして `Authorization: Bearer ...` ヘッダー付きで GET を送ります。
+1. `element` 自体が `None` ならデフォルト値を返す
+2. `element.find(path)` で子要素を探す
+3. 見つからない、または文字列が空ならデフォルト値を返す
+4. そうでなければ `.text.strip()` を返す
 
 ---
 
-## 7. `fetch_show`
+## 5. `parse_episode`
 
 ```python
-def fetch_show(show_id: str, access_token: str, market: str) -> dict[str, Any]:
-    return api_get(f"/shows/{show_id}", access_token, {"market": market})
+def parse_episode(item: ET.Element) -> dict[str, Any]:
 ```
 
-これは番組そのものの情報を取得するだけの薄いラッパー関数です。
+この関数は、RSS の `<item>` 1件を、Python の辞書へ変換します。
 
-取得できる情報の例:
+RSS における `<item>` は、1エピソードに相当します。
 
-- 番組名
-- 配信者
-- 番組概要
-- 総エピソード数
+返している項目は次です。
 
-関数を分けることで、「何を取得しているか」がコード上で分かりやすくなります。
+- `title`
+- `description`
+- `content_encoded`
+- `summary`
+- `published_at`
+- `guid`
+- `link`
+- `episode_url`
+- `episode_type`
+- `duration`
+
+ここでのポイントは `enclosure` です。
+
+```python
+enclosure = item.find("enclosure")
+```
+
+Podcast RSS では、音声ファイル本体 URL が `<enclosure>` に入っていることが多いです。
+
+```python
+"episode_url": enclosure.get("url", "") if enclosure is not None else "",
+```
+
+この行では、`enclosure` があるときだけ `url` 属性を読み、なければ空文字にしています。
 
 ---
 
-## 8. `fetch_all_episodes`
+## 6. `parse_feed`
 
 ```python
-def fetch_all_episodes(show_id: str, access_token: str, market: str) -> list[dict[str, Any]]:
+def parse_feed(root: ET.Element, rss_url: str) -> dict[str, Any]:
 ```
 
-このスクリプトの中心です。  
-Spotify API は 1 回で全件返さず、ページ単位で返すので、繰り返し取得しています。
+この関数は、RSS 全体を JSON 保存向けの辞書に変換します。
+
+まず `channel` を取ります。
 
 ```python
-episodes: list[dict[str, Any]] = []
-limit = 50
-offset = 0
+channel = root.find("channel")
+if channel is None:
+    raise RuntimeError("RSS に channel 要素が見つかりませんでした。")
 ```
 
-- `episodes`: 集めたエピソードをためるリスト
-- `limit = 50`: 1 回で最大 50 件取得
-- `offset = 0`: 何件目から取るか
+RSS 2.0 では、番組情報やエピソード一覧は通常 `channel` の下にあります。
 
-ループ本体は次です。
+次に `item` を全部集めます。
 
 ```python
-while True:
-    payload = api_get(
-        f"/shows/{show_id}/episodes",
-        access_token,
-        {"market": market, "limit": limit, "offset": offset},
-    )
-    items = payload.get("items", [])
-    episodes.extend(items)
-
-    if not payload.get("next"):
-        break
-    offset += limit
+items = channel.findall("item")
+episodes = [parse_episode(item) for item in items]
 ```
 
-流れはこうです。
+ここで、各 `item` を `parse_episode()` で変換しています。
 
-1. 50 件ずつ API から取得する
-2. `items` を `episodes` に追加する
-3. 次ページ URL がなければ終了する
-4. 次ページがあれば `offset` を 50 増やして続ける
-
-`payload["next"]` は「次のページがあるか」を判断するために使っています。
-
----
-
-## 9. `build_output`
-
-```python
-def build_output(show: dict[str, Any], episodes: list[dict[str, Any]], market: str) -> dict[str, Any]:
-```
-
-この関数は、API から受け取った大きなデータを、そのまま保存しやすい形に整えています。
-
-出力 JSON の構造は次のイメージです。
+最終的に返す JSON は、次のような構造です。
 
 ```json
 {
   "fetched_at": "...",
-  "market": "JP",
-  "show": {
-    "id": "...",
-    "name": "..."
+  "source": {
+    "type": "rss",
+    "url": "..."
+  },
+  "podcast": {
+    "title": "...",
+    "description": "..."
   },
   "episodes": [
     {
-      "id": "...",
-      "name": "...",
+      "title": "...",
       "description": "..."
     }
   ]
 }
 ```
 
-ポイントは、必要そうな項目だけを抜き出していることです。  
-こうしておくと、後で JSON を見たときに扱いやすくなります。
-
-特にフェーズ2の「曲抽出」で使いそうなのは次です。
-
-- `name`
-- `description`
-- `html_description`
-- `release_date`
-
 ---
 
-## 10. `parse_args`
+## 7. `parse_args`
 
 ```python
 def parse_args() -> argparse.Namespace:
 ```
 
-この関数は、コマンドライン引数を定義しています。
+この関数はコマンドライン引数を定義しています。
 
 ```python
-parser.add_argument("show_id", help="Spotify の番組 ID")
+parser.add_argument("rss_url", help="Podcast RSS の URL")
 ```
 
 これは必須引数です。  
-つまり、実行時に番組 ID を 1 つ渡す必要があります。
-
-```python
-parser.add_argument(
-    "--market",
-    default=os.getenv("SPOTIFY_MARKET", "JP"),
-)
-```
-
-これは任意引数です。指定しなければ `JP` を使います。  
-ただし `SPOTIFY_MARKET` 環境変数があれば、そちらを優先します。
+実行時に RSS URL を 1 つ渡す必要があります。
 
 ```python
 parser.add_argument(
@@ -321,27 +255,24 @@ parser.add_argument(
 )
 ```
 
-出力先を変えたいときのための引数です。
+こちらは任意引数で、出力先ファイルを変えたいときに使います。
 
 ---
 
-## 11. `main`
+## 8. `main`
 
 ```python
 def main() -> int:
 ```
 
-全体の処理を順番に実行する関数です。
+この関数が全体の流れを制御しています。
 
-中身は次の順です。
+処理順は次です。
 
 1. 引数を読む
-2. 環境変数から `client_id` と `client_secret` を取得する
-3. アクセストークンを取得する
-4. 番組情報を取得する
-5. 全エピソードを取得する
-6. 保存用データを組み立てる
-7. `data/episodes.json` に保存する
+2. RSS XML を取得する
+3. RSS 全体を辞書に変換する
+4. `data/episodes.json` に保存する
 
 保存処理はこの部分です。
 
@@ -354,24 +285,24 @@ output_path.write_text(
 )
 ```
 
-ここでやっていること:
+やっていることは次です。
 
 - 親ディレクトリがなければ作る
 - JSON を UTF-8 で保存する
-- `ensure_ascii=False` で日本語をそのまま書く
-- `indent=2` で読みやすく整形する
+- 日本語をそのまま書く
+- 読みやすいようにインデントを付ける
 
-最後に成功メッセージを表示します。
+最後に、取得件数を表示します。
 
 ```python
-print(f"{len(episodes)} 件のエピソードを {output_path} に保存しました。")
+print(f"{len(output['episodes'])} 件のエピソードを {output_path} に保存しました。")
 ```
 
 ---
 
-## 12. 例外処理の考え方
+## 9. 例外処理の考え方
 
-`main()` の中では `try` / `except` を使っています。
+このスクリプトでは、途中で失敗したら `RuntimeError` を投げ、最後に `main()` でまとめて扱っています。
 
 ```python
 except RuntimeError as exc:
@@ -379,65 +310,56 @@ except RuntimeError as exc:
     return 1
 ```
 
-ここでの考え方は単純です。
-
-- 細かい失敗理由は各関数で `RuntimeError` にまとめる
-- 最後に `main()` で表示して終了コード `1` を返す
-
-この形にすると、処理の責務が分かれます。
-
-- 各関数: 何が失敗したかを作る
-- `main()`: 失敗したら表示して終了する
+こうしておくと、各関数は「何が失敗したか」を表現することに集中でき、`main()` は「失敗したら表示して終了する」ことに集中できます。
 
 ---
 
-## 13. このスクリプトの良い点
+## 10. Spotify API 版との違い
 
-初心者目線でも、次の点は学びやすい構成です。
+以前の版では Spotify API を使っていましたが、現在は RSS ベースに切り替えています。
 
-- 関数ごとに役割が分かれている
-- HTTP 通信処理が共通化されている
-- エラー処理が最低限入っている
-- 出力 JSON の形が明示されている
-- 外部ライブラリなしで動く
+主な違いは次です。
+
+- 認証情報が不要
+- XML を扱う
+- ページングは不要
+- API レスポンスではなく RSS 構造を読む
+
+この変更によって、フェーズ1の「全エピソード取得」をよりシンプルに進められます。
 
 ---
 
-## 14. 今後の改善ポイント
+## 11. 今後の改善ポイント
 
 今の段階では十分ですが、次の改善余地があります。
 
-- `.env` ファイル読み込み対応
-- リトライ処理の追加
-- レート制限時の待機処理
-- ログ出力の整理
-- JSON だけでなく CSV も同時出力
-- `episodes` を dataclass などで型付きにする
-
-ただし、学習目的なら今のシンプルさはかなり良いです。  
-最初から複雑にしない方が理解しやすいです。
+- Shift_JIS など UTF-8 以外の RSS にも対応する
+- `itunes:episode`, `itunes:season` など追加項目も保存する
+- HTML を含む概要欄の整形を後段でやりやすくする
+- JSON だけでなく CSV も出力する
+- RSS URL の妥当性チェックを追加する
 
 ---
 
-## 15. 最低限ここだけ理解できれば十分
+## 12. 最低限ここだけ理解できれば十分
 
 まずは次の 3 点を押さえれば、このスクリプトは読めたと言ってよいです。
 
-1. `main()` が全体の流れを制御している
-2. `fetch_all_episodes()` がページングしながら全件取得している
-3. `build_output()` が保存しやすい JSON 形式に整えている
+1. `fetch_xml()` が RSS を取ってくる
+2. `parse_episode()` が 1 件の `<item>` を辞書へ変換する
+3. `parse_feed()` が番組全体を保存用データへまとめる
 
 ---
 
-## 16. 次の学習ステップ
+## 13. 次の学習ステップ
 
-次に学ぶと理解が深まりやすいのはこの順です。
+次に学ぶと理解しやすいのはこの順です。
 
-1. Python の `list` と `dict`
-2. 関数定義 `def`
-3. 例外処理 `try` / `except`
-4. JSON の読み書き
-5. HTTP リクエストの基本
+1. Python の `dict` と `list`
+2. XML の基本構造
+3. `ElementTree` の `find()` と `findall()`
+4. 例外処理 `try` / `except`
+5. JSON の保存
 6. コマンドライン引数 `argparse`
 
-必要なら次に、[`scripts/fetch_episodes.py`](C:/Users/nemoto/Documents/dev/private/podcast-playlist-builder/scripts/fetch_episodes.py) に対して「1 行ずつコメントを付けた学習用バージョン」も作れます。
+必要なら次に、RSS サンプルを見ながら「このタグが Python のどのコードで読まれているか」を対応表にしてまとめることもできます。
